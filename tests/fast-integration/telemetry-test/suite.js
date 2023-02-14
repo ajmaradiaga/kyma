@@ -9,6 +9,9 @@ const {
   k8sDelete,
   sleep,
   fromBase64,
+  getGateway,
+  getVirtualService,
+  retryPromise,
 } = require('../utils');
 const {
   logsPresentInLoki,
@@ -26,7 +29,22 @@ const {
   waitForTracePipelineStatusRunning,
   waitForTracePipelineStatusPending,
 } = require('./helpers');
+const axios = require('axios');
+const {getJaegerTracesForService, getJaegerServices} = require('../tracing/client');
 
+async function getTracingTestAppUrl() {
+  const vs = await getVirtualService('tracing-test', 'tracing-test-app');
+  const host = vs.spec.hosts[0];
+  return `https://${host}`;
+}
+
+async function callTracingTestApp() {
+  const testAppUrl = await getTracingTestAppUrl();
+
+  return retryPromise(async () => {
+    return await axios.get(testAppUrl, {timeout: 10000});
+  }, 5, 30);
+}
 
 async function prepareEnvironment() {
   async function k8sApplyFile(name, namespace) {
@@ -58,7 +76,8 @@ async function cleanEnvironment() {
 
 describe('Telemetry Operator', function() {
   const testStartTimestamp = new Date().toISOString();
-
+  const defaultRetryDelayMs = 1000;
+  const defaultRetries = 5;
   before('Prepare environment, expose Grafana', async function() {
     await prepareEnvironment();
     await exposeGrafana();
@@ -113,7 +132,7 @@ describe('Telemetry Operator', function() {
         const pipeline = loadTestData('logpipeline-custom-filter-unknown.yaml');
 
         try {
-          await k8sApply(pipeline);
+          await retryWithDelayForErrorCode((r) => k8sApply(pipeline), defaultRetryDelayMs, defaultRetries, 403);
           await k8sDelete(pipeline);
           assert.fail('Should not be able to apply a LogPipeline with an unknown custom filter');
         } catch (e) {
@@ -128,7 +147,7 @@ describe('Telemetry Operator', function() {
         const pipeline = loadTestData('logpipeline-custom-filter-denied.yaml');
 
         try {
-          await k8sApply(pipeline);
+          await retryWithDelayForErrorCode((r) => k8sApply(pipeline), defaultRetryDelayMs, defaultRetries, 403);
           await k8sDelete(pipeline);
           assert.fail('Should not be able to apply a LogPipeline with a denied custom filter');
         } catch (e) {
@@ -145,7 +164,7 @@ describe('Telemetry Operator', function() {
       const parserName = parser[0].metadata.name;
 
       it(`Should create LogParser '${parserName}'`, async function() {
-        await k8sApply(parser);
+        await retryWithDelay( (r)=> k8sApply(parser), defaultRetryDelayMs, defaultRetries);
       });
 
       it('Should parse the logs using regex', async function() {
@@ -219,7 +238,7 @@ describe('Telemetry Operator', function() {
         const pipelineName = pipeline[0].metadata.name;
 
         it(`Should create LogPipeline '${pipelineName}'`, async function() {
-          await k8sApply(pipeline);
+          await retryWithDelay( (r) => k8sApply(pipeline), defaultRetryDelayMs, defaultRetries);
           await waitForLogPipelineStatusRunning(pipelineName);
         });
 
@@ -279,7 +298,7 @@ describe('Telemetry Operator', function() {
           const pipelineName = pipeline[0].metadata.name;
 
           it(`Should create LogPipeline '${pipelineName}'`, async function() {
-            await k8sApply(pipeline);
+            await retryWithDelay( (r) => k8sApply(pipeline), defaultRetryDelayMs, defaultRetries);
             await waitForLogPipelineStatusRunning(pipelineName);
           });
 
@@ -333,8 +352,13 @@ describe('Telemetry Operator', function() {
   context('Configurable Tracing', function() {
     context('Configurable Tracing', function() {
       context('TracePipeline', function() {
+        const jaeger = loadTestData('tracepipeline-jaeger.yaml');
         const firstPipeline = loadTestData('tracepipeline-output-otlp-secret-ref-1.yaml');
         const firstPipelineName = firstPipeline[0].metadata.name;
+
+        it(`Should clean up TracePipeline jaeger`, async function() {
+          await k8sDelete(jaeger);
+        });
 
         it(`Should create TracePipeline '${firstPipelineName}'`, async function() {
           await k8sApply(firstPipeline);
@@ -442,7 +466,7 @@ describe('Telemetry Operator', function() {
         });
 
         it(`Deletes the override configmap`, async function() {
-          k8sDelete(overrideConfig);
+          await k8sDelete(overrideConfig);
         });
 
         it(`Tries to change the otlp endpoint again`, async function() {
@@ -458,7 +482,99 @@ describe('Telemetry Operator', function() {
           const secret = await getSecret('telemetry-trace-collector', 'kyma-system');
           assert.equal(fromBase64(secret.data.OTLP_ENDPOINT), 'http://another-foo-bar');
         });
+
+        it(`Should delete TracePipeline`, async function() {
+          await k8sDelete(pipeline);
+        });
+      });
+
+      context('Filter Processor', function() {
+        const testApp = loadTestData('tracepipeline-test-app.yaml');
+        const testAppIstioPatch = loadTestData('tracepipeline-test-istio-telemetry-patch.yaml');
+
+        it(`Should create test app`, async function() {
+          const kymaGateway = await getGateway('kyma-system', 'kyma-gateway');
+          let kymaHostUrl = kymaGateway.spec.servers[0].hosts[0];
+          kymaHostUrl = kymaHostUrl.replace('*', 'tracing-test-app');
+          for (const resource of testApp ) {
+            if (resource.kind == 'VirtualService') {
+              resource.spec.hosts[0] = kymaHostUrl;
+            }
+          }
+          await retryWithDelay( (r) => k8sApply(testApp), defaultRetryDelayMs, defaultRetries);
+          await retryWithDelay( (r) =>k8sApply(testAppIstioPatch), defaultRetryDelayMs, defaultRetries);
+          await waitForPodWithLabel('app', 'tracing-test-app', 'tracing-test');
+        });
+
+        it(`Should call test app and produce spans`, async function() {
+          for (let i=0; i < 10; i++) {
+            await retryWithDelay(callTracingTestApp, defaultRetryDelayMs, defaultRetries);
+            await sleep(500);
+          }
+        });
+
+        it(`Should filter out noisy spans`, async function() {
+          const services = await retryWithDelay(getJaegerServices, defaultRetryDelayMs, defaultRetries);
+          assert.isFalse(services.data.includes('grafana.kyma-system'), 'spans are present for grafana');
+          assert.isFalse(services.data.includes('jaeger.kyma-system'), 'spans are present for jaeger');
+          assert.isFalse(services.data.includes('telemetry-fluent-bit.kyma-system'),
+              'spans are present for fluent-bit');
+          assert.isFalse(services.data.includes('loki.kyma-system'), 'spans are present for loki');
+        });
+
+        it(`Should find test spans`, async function() {
+          const testAppTraces = await retryWithDelay( async (r) => {
+            const testAppTraces = await getJaegerTracesForService('tracing-test-app', 'tracing-test');
+            if (testAppTraces.data.length > 0) {
+              return testAppTraces;
+            }
+
+            throw testAppTraces;
+          }, defaultRetryDelayMs, 20);
+          assert.isTrue(testAppTraces.data.length > 0, 'No spans present for test application "tracing-test-app"');
+        });
+
+        it(`Should delete test setup`, async function() {
+          testAppIstioPatch[0].spec.tracing[0].randomSamplingPercentage = 1;
+          await k8sApply(testAppIstioPatch);
+          await k8sDelete(testApp);
+        });
       });
     });
   });
+});
+
+const wait = (ms) => new Promise((resolve) => {
+  setTimeout(() => resolve(), ms);
+});
+
+const retryWithDelay = (operation, delay, retries) => new Promise((resolve, reject) => {
+  return operation()
+      .then(resolve)
+      .catch((reason) => {
+        if (retries > 0) {
+          return wait(delay)
+              .then(retryWithDelay.bind(null, operation, delay, retries - 1))
+              .then(resolve)
+              .catch(reject);
+        }
+        return reject(reason);
+      });
+});
+
+const retryWithDelayForErrorCode = (operation, delay, retries, expectedErrorCode) => new Promise((resolve, reject) => {
+  return operation()
+      .then(resolve)
+      .catch((reason) => {
+        if (reason.statusCode !== undefined && reason.statusCode === expectedErrorCode) {
+          return reject(reason);
+        }
+        if (retries > 0) {
+          return wait(delay)
+              .then(retryWithDelay.bind(null, operation, delay, retries - 1, expectedErrorCode))
+              .then(resolve)
+              .catch(reject);
+        }
+        return reject(reason);
+      });
 });

@@ -6,10 +6,11 @@ import (
 
 	cev2event "github.com/cloudevents/sdk-go/v2/event"
 
-	"github.com/kyma-project/kyma/components/event-publisher-proxy/pkg/application"
 	"github.com/kyma-project/kyma/components/eventing-controller/logger"
 	"github.com/kyma-project/kyma/components/eventing-controller/pkg/backend/cleaner"
 	"go.uber.org/zap"
+
+	"github.com/kyma-project/kyma/components/event-publisher-proxy/pkg/application"
 )
 
 // Perform a compile-time check.
@@ -60,17 +61,20 @@ func (gb *GenericBuilder) Build(event cev2event.Event) (*cev2event.Event, error)
 	ceEvent.SetExtension(OriginalTypeHeaderName, event.Type())
 	// set prefixed type
 	ceEvent.SetType(finalEventType)
-	ceEvent.SetSource(cleanSource)
+	// validate the final cloud event
+	if err = ceEvent.Validate(); err != nil {
+		return nil, err
+	}
 
 	return &ceEvent, nil
 }
 
-// getFinalSubject return the final prefixed event type
+// getFinalSubject returns the final prefixed event type.
 func (gb *GenericBuilder) getFinalSubject(source, eventType string) string {
 	return fmt.Sprintf("%s.%s.%s", gb.typePrefix, source, eventType)
 }
 
-// GetAppNameOrSource returns the application name if exists, otherwise returns source name
+// GetAppNameOrSource returns the application name if exists, otherwise returns source name.
 func (gb *GenericBuilder) GetAppNameOrSource(source string, namedLogger *zap.SugaredLogger) string {
 	var appName = source
 	if appObj, err := gb.applicationLister.Get(source); err == nil && appObj != nil {

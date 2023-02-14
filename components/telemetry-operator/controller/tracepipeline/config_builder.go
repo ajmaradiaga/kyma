@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/kyma-project/kyma/components/telemetry-operator/apis/telemetry/v1alpha1"
+	"github.com/kyma-project/kyma/components/telemetry-operator/internal/utils/envvar"
 )
 
 type TLSConfig struct {
@@ -24,7 +25,7 @@ type RetryOnFailureConfig struct {
 
 type OTLPExporterConfig struct {
 	Endpoint       string               `yaml:"endpoint,omitempty"`
-	Headers        map[string]any       `yaml:"headers,omitempty"`
+	Headers        map[string]string    `yaml:"headers,omitempty"`
 	TLS            TLSConfig            `yaml:"tls,omitempty"`
 	SendingQueue   SendingQueueConfig   `yaml:"sending_queue,omitempty"`
 	RetryOnFailure RetryOnFailureConfig `yaml:"retry_on_failure,omitempty"`
@@ -163,14 +164,20 @@ func getOutputType(output v1alpha1.TracePipelineOutput) string {
 	return "otlp"
 }
 
+func makeHeaders(output v1alpha1.TracePipelineOutput) map[string]string {
+	headers := make(map[string]string)
+	if output.Otlp.Authentication != nil && output.Otlp.Authentication.Basic.IsDefined() {
+		headers["Authorization"] = fmt.Sprintf("${%s}", basicAuthHeaderVariable)
+	}
+	for _, header := range output.Otlp.Headers {
+		headers[header.Name] = fmt.Sprintf("${HEADER_%s}", envvar.MakeEnvVarCompliant(header.Name))
+	}
+	return headers
+}
+
 func makeExporterConfig(output v1alpha1.TracePipelineOutput, insecureOutput bool) ExporterConfig {
 	outputType := getOutputType(output)
-	var headers map[string]any
-	if output.Otlp.Authentication != nil && output.Otlp.Authentication.Basic.IsDefined() {
-		headers = map[string]any{
-			"Authorization": fmt.Sprintf("${%s}", basicAuthHeaderVariable),
-		}
-	}
+	headers := makeHeaders(output)
 	otlpExporterConfig := OTLPExporterConfig{
 		Endpoint: fmt.Sprintf("${%s}", otlpEndpointVariable),
 		Headers:  headers,
@@ -282,6 +289,9 @@ func makeSpanFilterConfig() []string {
 	return []string{
 		"(attributes[\"http.method\"] == \"POST\") and (attributes[\"component\"] == \"proxy\") and (attributes[\"OperationName\"] == \"Ingress\") and (resource.attributes[\"service.name\"] == \"jaeger.kyma-system\")",
 		"(attributes[\"http.method\"] == \"GET\") and (attributes[\"component\"] == \"proxy\") and (attributes[\"OperationName\"] == \"Egress\") and (resource.attributes[\"service.name\"] == \"grafana.kyma-system\")",
+		"(attributes[\"http.method\"] == \"GET\") and (attributes[\"component\"] == \"proxy\") and (attributes[\"OperationName\"] == \"Ingress\") and (resource.attributes[\"service.name\"] == \"jaeger.kyma-system\")",
+		"(attributes[\"http.method\"] == \"GET\") and (attributes[\"component\"] == \"proxy\") and (attributes[\"OperationName\"] == \"Ingress\") and (resource.attributes[\"service.name\"] == \"grafana.kyma-system\")",
+		"(attributes[\"http.method\"] == \"GET\") and (attributes[\"component\"] == \"proxy\") and (attributes[\"OperationName\"] == \"Ingress\") and (resource.attributes[\"service.name\"] == \"loki.kyma-system\")",
 		"(attributes[\"http.method\"] == \"GET\") and (attributes[\"component\"] == \"proxy\") and (attributes[\"OperationName\"] == \"Ingress\") and (IsMatch(attributes[\"http.url\"], \".+/metrics\") == true) and (resource.attributes[\"k8s.namespace.name\"] == \"kyma-system\")",
 		"(attributes[\"http.method\"] == \"GET\") and (attributes[\"component\"] == \"proxy\") and (attributes[\"OperationName\"] == \"Ingress\") and (IsMatch(attributes[\"http.url\"], \".+/healthz(/.*)?\") == true) and (resource.attributes[\"k8s.namespace.name\"] == \"kyma-system\")",
 		"(attributes[\"http.method\"] == \"GET\") and (attributes[\"component\"] == \"proxy\") and (attributes[\"OperationName\"] == \"Ingress\") and (attributes[\"user_agent\"] == \"vm_promscrape\")",
